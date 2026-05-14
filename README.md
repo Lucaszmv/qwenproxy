@@ -99,8 +99,10 @@ OpenAI-compatible endpoint.
 **Note**: If `API_KEY` is configured, include the Bearer token in your request headers.
 
 #### Models
-- `qwen3.6-plus` (with thinking)
-- `qwen3.6-plus-no-thinking`
+- `qwen3.6-plus` (Qwen.ai, with thinking)
+- `qwen3.6-plus-no-thinking` (Qwen.ai)
+- `qwen/qwen3-coder-480b-a35b-instruct` (NVIDIA NIM)
+- Qualque modelo da NVIDIA NIM usando o formato `vendor/model` (ex: `meta/llama-3_1-70b-instruct`)
 
 ---
 

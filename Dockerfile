@@ -1,32 +1,26 @@
-FROM node:20-slim
-
-# Install dependencies for Playwright
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    ca-certificates \
-    procps \
-    libgconf-2-4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libgdk-pixbuf2.0-0 \
-    libgtk-3-0 \
-    libgbm-dev \
-    libnss3-dev \
-    libxss-dev \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
+# Use a official Playwright image that already has all dependencies
+FROM mcr.microsoft.com/playwright:v1.49.1-noble
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install
+# Install pnpm
+RUN npm install -g pnpm
 
-# Install Playwright browsers
-RUN npx playwright install chromium --with-deps
+# Copy only dependency files for caching
+COPY package.json pnpm-lock.yaml ./
 
+# Install dependencies
+RUN pnpm install --frozen-lockfile
+
+# Copy the rest of the application
 COPY . .
 
+# Set environment variables
+ENV NODE_ENV=production
+ENV PORT=3000
+
+# Expose the application port
 EXPOSE 3000
 
-CMD ["npm", "start"]
+# Start the application
+CMD ["pnpm", "start"]

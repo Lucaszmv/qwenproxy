@@ -4,9 +4,12 @@ services:
   qwenproxy:
     build: .
     ports:
-      - "${PORT:-8080}:8080"
+      - "${PORT:-3000}:3000"
     env_file:
       - .env
     volumes:
-      - ./qwen_profile:/app/qwen_profile
+      - proxy_storage:/app/browser_sessions
     restart: always
+
+volumes:
+  proxy_storage:

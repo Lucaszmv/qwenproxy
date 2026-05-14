@@ -12,6 +12,7 @@ import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
 import { createQwenStream, updateSessionParent } from '../services/qwen.ts';
+import { createNvidiaStream } from '../services/nvidia.ts';
 import { OpenAIRequest, ChoiceDelta, Message } from '../utils/types.ts';
 import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
@@ -106,12 +107,22 @@ export async function chatCompletions(c: Context) {
     let stream: ReadableStream;
     let uiSessionId = '';
     let retries = 3;
+
+    const nvidiaVendors = ['meta/', 'mistralai/', 'google/', 'deepseek-ai/', 'nvidia/', 'qwen/', 'z-ai/', 'moonshotai/'];
+    const isNvidiaModel = nvidiaVendors.some(v => body.model.startsWith(v)) || body.model.includes('qwen3-coder-480b');
+
     while (retries > 0) {
       try {
-        // If it's a new session, force parent_message_id to null
-        const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
-        stream = result.stream;
-        uiSessionId = result.uiSessionId;
+        if (isNvidiaModel) {
+          const result = await createNvidiaStream(body.messages || [], body.model);
+          stream = result.stream;
+          uiSessionId = 'nvidia-session'; // NVIDIA doesn't use the same session tracking as Qwen.ai
+        } else {
+          // If it's a new session, force parent_message_id to null
+          const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
+          stream = result.stream;
+          uiSessionId = result.uiSessionId;
+        }
         break; // Success
       } catch (err: any) {
         retries--;
@@ -119,6 +130,61 @@ export async function chatCompletions(c: Context) {
         // Wait a bit before retrying
         await new Promise(r => setTimeout(r, 1000));
       }
+    }
+
+    if (!isStream) {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = '';
+      let fullReasoning = '';
+      let usage: any = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunkText = decoder.decode(value, { stream: true });
+        const lines = chunkText.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') continue;
+
+          try {
+            const chunk = JSON.parse(dataStr);
+            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+               const delta = chunk.choices[0].delta;
+               if (delta.content) fullContent += delta.content;
+               if (delta.reasoning_content) fullReasoning += delta.reasoning_content;
+            }
+            if (chunk.usage) usage = chunk.usage;
+          } catch (e) {}
+        }
+      }
+
+      return c.json({
+        id: 'chatcmpl-' + uuidv4(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: fullContent,
+              reasoning_content: fullReasoning || undefined
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: usage || {
+          prompt_tokens: Math.ceil(finalPrompt.length / 3.5),
+          completion_tokens: Math.ceil(fullContent.length / 3.5),
+          total_tokens: Math.ceil((finalPrompt.length + fullContent.length) / 3.5)
+        }
+      });
     }
 
     c.header('Content-Type', 'text/event-stream');
@@ -230,6 +296,10 @@ export async function chatCompletions(c: Context) {
                     foundStr = true;
                   }
                 }
+              } else if (delta.content !== undefined) {
+                // NVIDIA / Standard OpenAI format
+                vStr = delta.content || '';
+                foundStr = true;
               }
             }
 

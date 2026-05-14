@@ -16,7 +16,9 @@ let context: BrowserContext | null = null;
 export let activePage: Page | null = null;
 let currentHeaders: Record<string, string> = {};
 let cachedQwenHeaders: { headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null } | null = null;
+let cachedNvidiaHeaders: Map<string, { headers: Record<string, string>, modelId: string, timestamp: number }> = new Map();
 let lastHeadersTime = 0;
+let lastNvidiaHeadersTime = 0;
 const HEADERS_TTL = 10 * 60 * 1000; // 10 minutes
 
 // Lock to prevent concurrent UI interactions
@@ -46,7 +48,7 @@ export async function initPlaywright(headless = true) {
     return;
   }
 
-  const profilePath = path.resolve('qwen_profile');
+  const profilePath = path.resolve('browser_sessions');
   
   context = await chromium.launchPersistentContext(profilePath, {
     headless,
@@ -318,6 +320,135 @@ async function _getQwenHeadersInternal(forceNew = false): Promise<{ headers: Rec
         await activePage!.focus(inputSelector);
         await activePage!.keyboard.press('Enter');
       }
+    });
+  });
+}
+
+/**
+ * Ensures the NVIDIA session is valid and extracts headers/captcha token.
+ */
+export async function getNvidiaHeaders(modelSlug?: string, prompt?: string, forceNew = false): Promise<{ headers: Record<string, string>, modelId: string }> {
+  const release = await new Promise<() => void>(resolve => {
+    uiLock = uiLock.then(() => new Promise<void>(innerResolve => {
+      resolve(innerResolve);
+    }));
+  });
+
+  try {
+    return await _getNvidiaHeadersInternal(modelSlug, prompt, forceNew);
+  } finally {
+    release();
+  }
+}
+
+async function _getNvidiaHeadersInternal(modelSlug?: string, prompt?: string, forceNew = false): Promise<{ headers: Record<string, string>, modelId: string }> {
+  const cacheKey = modelSlug || 'qwen/qwen3-coder-480b-a35b-instruct';
+  
+  // For NVIDIA, we should NOT cache the captcha token for too long or across different prompts
+  // as it might be tied to the request content or be one-time use.
+  // However, we can cache it for a very short time (e.g. 30 seconds) to handle retries.
+  const cached = cachedNvidiaHeaders.get(cacheKey);
+  if (!forceNew && !prompt && cached && (Date.now() - cached.timestamp < 30000)) {
+    return { headers: cached.headers, modelId: cached.modelId };
+  }
+
+  if (!activePage) {
+    throw new Error('Playwright not initialized');
+  }
+
+  const currentUrl = activePage.url();
+  const isOnNvidia = currentUrl.includes('build.nvidia.com');
+  const targetUrl = modelSlug ? `https://build.nvidia.com/${modelSlug}` : 'https://build.nvidia.com/qwen/qwen3-coder-480b-a35b-instruct';
+
+  if (!isOnNvidia || (modelSlug && !currentUrl.includes(modelSlug)) || forceNew) {
+    console.log(`[Playwright] Navigating to NVIDIA ${modelSlug || 'Qwen'}... (Current: ${currentUrl})`);
+    await activePage.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+  }
+
+  // Handle Modals
+  console.log('[Playwright] Clearing NVIDIA modals...');
+  const buttonsToClick = [
+    'button:has-text("Accept All")',
+    'button:has-text("Acknowledge & Continue")'
+  ];
+
+  for (let i = 0; i < 3; i++) {
+    for (const selector of buttonsToClick) {
+      try {
+        const btn = activePage.locator(selector).first();
+        if (await btn.isVisible()) {
+          await btn.click({ timeout: 2000 });
+        }
+      } catch (e) {
+        // ignore errors if button not found or hidden
+      }
+    }
+    await activePage.waitForTimeout(500);
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Timeout waiting for NVIDIA headers'));
+    }, 60000);
+
+    const routeHandler = async (route: any, request: any) => {
+      const reqHeaders = request.headers();
+      
+      if (reqHeaders['nv-captcha-token']) {
+        clearTimeout(timeout);
+        console.log('[Playwright] Intercepted NVIDIA headers.');
+        
+        let interceptedModelId = cacheKey;
+        const postData = request.postData();
+        if (postData) {
+          try {
+            const body = JSON.parse(postData);
+            if (body.model) interceptedModelId = body.model;
+          } catch (e) {}
+        }
+
+        const extractedHeaders = {
+          'accept': 'text/event-stream',
+          'content-type': 'application/json',
+          'nv-captcha-token': reqHeaders['nv-captcha-token'],
+          'nv-function-id': reqHeaders['nv-function-id'],
+          'referer': 'https://build.nvidia.com/',
+          'user-agent': reqHeaders['user-agent'] || '',
+          'origin': 'https://build.nvidia.com',
+          'sec-ch-ua-platform': reqHeaders['sec-ch-ua-platform'] || '"Windows"',
+          'sec-fetch-dest': 'empty',
+          'sec-fetch-mode': 'cors',
+          'sec-fetch-site': 'cross-site'
+        };
+
+        if (!extractedHeaders['nv-function-id']) {
+           console.log('[Playwright] Intercepted request missing nv-function-id, skipping...');
+           await route.continue();
+           return;
+        }
+
+        cachedNvidiaHeaders.set(cacheKey, { 
+          headers: extractedHeaders, 
+          modelId: interceptedModelId, 
+          timestamp: Date.now() 
+        });
+
+        await route.abort('aborted');
+        await activePage!.unroute('**/predict/models/**', routeHandler);
+        resolve({ headers: extractedHeaders, modelId: interceptedModelId });
+      } else {
+        await route.continue();
+      }
+    };
+
+    activePage!.route('**/predict/models/**', routeHandler).then(async () => {
+      console.log('[Playwright] Triggering NVIDIA request...');
+      const textbox = await activePage!.waitForSelector('textarea:visible, [data-testid="nv-text-area-element"]');
+      await textbox.focus();
+      // Use the actual prompt if provided, otherwise a placeholder
+      const triggerText = prompt ? (prompt.length > 50 ? prompt.substring(0, 50) : prompt) : 'hello';
+      await textbox.fill(triggerText);
+      await activePage!.keyboard.press('Enter');
     });
   });
 }
